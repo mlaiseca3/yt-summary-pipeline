@@ -1,6 +1,9 @@
 import os
 import re
 import requests
+import time
+import random
+import yt_dlp
 from google import genai
 from google.genai import types
 import json
@@ -11,6 +14,8 @@ from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     NoTranscriptFound,
     VideoUnavailable,
+    IpBlocked,
+    RequestBlocked,
 )
 
 
@@ -59,8 +64,71 @@ def extract_channel_id(video_id: str) -> str:
         print("Video not found or is private/deleted.")
 
 
+def _clean_vtt(vtt_text: str) -> str:
+    """Remove VTT headers, timestamps, and styling tags to get plain text."""
+    lines = vtt_text.splitlines()
+    plain_text = []
+    # Skip VTT header (usually starts with "WEBVTT")
+    start_index = 0
+    for i, line in enumerate(lines):
+        if "Kind:" in line or "Language:" in line:
+            start_index = i + 1
+            break
+    
+    # If no header found, just start from the beginning
+    # But wait, VTT usually has "WEBVTT" at line 0.
+    
+    for line in lines[start_index:]:
+        # Skip timestamps (e.g., 00:00:00.000 --> 00:00:05.000)
+        if "-->" in line:
+            continue
+        # Skip empty lines and VTT header line
+        if not line.strip() or line.strip() == "WEBVTT":
+            continue
+        # Remove HTML-like tags (e.g., <c>Text</c>)
+        clean_line = re.sub(r'<[^>]*>', '', line)
+        if clean_line.strip():
+            plain_text.append(clean_line.strip())
+            
+    return " ".join(plain_text)
+
+
+def fetch_transcript_with_yt_dlp(video_id: str) -> str:
+    """Fallback: Fetch transcript using yt-dlp by extracting caption URLs."""
+    ydl_opts = {
+        'skip_download': True,
+        'quiet': True,
+        'no_warnings': True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+        
+        # Try automatic captions first, then manual subtitles
+        captions = info.get('automatic_captions') or info.get('subtitles')
+        if not captions:
+            raise RuntimeError("No captions available via yt-dlp")
+        
+        # Prefer English
+        en_captions = captions.get('en')
+        if not en_captions:
+            # Fallback to any available caption
+            first_lang = next(iter(captions), None)
+            if not first_lang:
+                raise RuntimeError("No captions available in any language")
+            en_captions = captions[first_lang]
+        
+        # en_captions is usually a list of formats; take the first one
+        caption_url = en_captions[0]['url'] if isinstance(en_captions, list) else en_captions[0]['url']
+        
+        resp = requests.get(caption_url)
+        resp.raise_for_status()
+        return _clean_vtt(resp.text)
+
+
 def get_transcript(video_id: str) -> str:
-    """Fetch the transcript text for a video, preferring English."""
+    """Fetch the transcript text for a video, preferring English.
+    Tries youtube-transcript-api first, then falls back to yt-dlp.
+    """
     ytt_api = YouTubeTranscriptApi()
     try:
         transcript_list = ytt_api.list(video_id)
@@ -72,12 +140,19 @@ def get_transcript(video_id: str) -> str:
             if transcript.is_translatable:
                 transcript = transcript.translate("en")
         fetched = transcript.fetch()
+        return " ".join(snippet.text for snippet in fetched)
 
-    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
-        raise RuntimeError(f"Could not get a transcript for this video: {e}")
-
-    # fetched is a FetchedTranscript of snippet objects (each with a .text attribute)
-    return " ".join(snippet.text for snippet in fetched)
+    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, IpBlocked, RequestBlocked) as e:
+        # If it's just disabled or unavailable, yt-dlp won't help
+        if isinstance(e, (TranscriptsDisabled, VideoUnavailable)):
+            raise RuntimeError(f"Could not get a transcript for this video: {e}")
+        
+        # For IP blocks, request blocks, or "No Transcript Found" (which might be a block in disguise), try yt-dlp
+        print(f"youtube-transcript-api failed ({e}), attempting yt-dlp fallback...")
+        try:
+            return fetch_transcript_with_yt_dlp(video_id)
+        except Exception as ydl_e:
+            raise RuntimeError(f"Both transcript methods failed. Final error: {ydl_e}")
 
 
 def summarize_transcript(transcript_text: str) -> dict:
@@ -186,7 +261,61 @@ def save_summary_to_json(video_url: str, output_dir: str = "output") -> None:
     with open(file_path, "w", encoding="utf-8") as file:
         json.dump(result, file, indent=4)
 
+def resolve_channel_id(channel_input: str) -> str:
+    """Resolve a channel URL, handle, or ID to a channel ID (starting with UC)."""
+    # 1. Already a channel ID
+    if channel_input.startswith("UC"):
+        return channel_input
+
+    # 2. Extract from URL
+    parsed = urlparse(channel_input)
+    if parsed.hostname in ("www.youtube.com", "youtube.com", "m.youtube.com"):
+        path = parsed.path
+        # /@handle
+        if path.startswith("/@"):
+            handle = path.split("/")[1].lstrip("@")
+            return _resolve_handle_to_id(handle)
+        # /channel/UC...
+        if path.startswith("/channel/"):
+            channel_id = path.split("/")[2]
+            if channel_id.startswith("UC"):
+                return channel_id
+
+    # 3. Is it a handle?
+    if channel_input.startswith("@"):
+        handle = channel_input.lstrip("@")
+        return _resolve_handle_to_id(handle)
+    
+    # 4. Try as a handle anyway if it doesn't look like a URL
+    if "://" not in channel_input:
+        handle = channel_input.lstrip("@")
+        try:
+            return _resolve_handle_to_id(handle)
+        except ValueError:
+            pass
+
+    raise ValueError(f"Could not resolve channel input to a channel ID: {channel_input}")
+
+
+def _resolve_handle_to_id(handle: str) -> str:
+    """Helper to resolve a YouTube handle to a channel ID using the API."""
+    youtube_api_url = "https://www.googleapis.com/youtube/v3/channels"
+    params = {
+        "part": "id",
+        "forHandle": handle,
+        "key": os.getenv("GOOGLE_APIS_KEY")
+    }
+    resp = requests.get(youtube_api_url, params=params)
+    resp.raise_for_status()
+    data = resp.json()
+    items = data.get("items", [])
+    if items:
+        return items[0]["id"]
+    raise ValueError(f"Could not resolve handle @{handle} to a channel ID.")
+
+
 def get_channel_uploads_playlist_id(channel_id: str) -> str:
+
     """Get the uploads playlist ID for a given channel ID."""
     return "UU" + channel_id[2:]
 
@@ -230,6 +359,150 @@ def save_all_channel_video_ids_to_json(channel_id: str, output_dir: str = "outpu
 def sanitize_folder_name(name: str) -> str:
     """Strip characters that aren't safe to use in a filesystem folder name."""
     return re.sub(r'[<>:"/\\|?*]', "_", name).strip()
+
+
+def save_transcripts_from_json(json_path: str, output_dir: str = "output") -> None:
+    """Read a JSON file of video IDs and save their transcripts to individual text files.
+    Implements resume capability, randomized delays, and progress tracking.
+    """
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    
+    video_ids = data.get("video_ids", [])
+    if not video_ids:
+        print("No video IDs found in the JSON file.")
+        return
+
+    channel_id = data.get("channel_id", "unknown_channel")
+    folder_path = os.path.join(output_dir, f"{channel_id}_transcripts")
+    os.makedirs(folder_path, exist_ok=True)
+
+    total = len(video_ids)
+    success_count = 0
+    fail_count = 0
+    skipped_count = 0
+
+    print(f"Starting pipeline for {total} videos...")
+    
+    for index, video_id in enumerate(video_ids, start=1):
+        file_path = os.path.join(folder_path, f"{video_id}.txt")
+        
+        if os.path.exists(file_path):
+            skipped_count += 1
+            continue
+
+        print(f"[{index}/{total}] Processing {video_id}...", end="\r")
+        try:
+            transcript = get_transcript(video_id)
+            with open(file_path, "w", encoding="utf-8") as f_out:
+                f_out.write(transcript)
+            success_count += 1
+        except RuntimeError as e:
+            fail_count += 1
+            print(f"\n[!] Error on {video_id}: {e}")
+            if "blocked" in str(e).lower():
+                print("Detected block. Pausing for 5 minutes to cooldown...")
+                time.sleep(300)
+            continue
+
+        time.sleep(random.uniform(2, 5))
+
+        if index % 10 == 0:
+            print(f"\n--- Progress Update: {index}/{total} | Success: {success_count} | Failed: {fail_count} | Skipped: {skipped_count} ---")
+
+    print(f"\n\nPipeline Complete!")
+    print(f"Total: {total}")
+    print(f"Successful: {success_count}")
+    print(f"Failed: {fail_count}")
+    print(f"Skipped: {skipped_count}")
+    print(f"Transcripts saved to {folder_path}")
+
+
+def summarize_transcripts_from_folder(transcripts_folder: str, output_dir: str = "output") -> None:
+    """Summarize all transcripts in a folder using Gemini, without re-fetching from YouTube.
+    Expects files to be named {video_id}.txt.
+    """
+    if not os.path.isdir(transcripts_folder):
+        print(f"Error: {transcripts_folder} is not a valid directory.")
+        return
+
+    files = [f for f in os.listdir(transcripts_folder) if f.endswith(".txt")]
+    if not files:
+        print("No .txt files found in the folder.")
+        return
+
+    print(f"Found {len(files)} transcripts to summarize...")
+
+    # Determine channel metadata from the first successful video to organize output
+    first_video_id = files[0].replace(".txt", "")
+    try:
+        channel_id = extract_channel_id(first_video_id)
+        channel_title = extract_channel_title(first_video_id) or "Unknown"
+    except Exception:
+        channel_id = "unknown"
+        channel_title = "Unknown"
+
+    folder_name = sanitize_folder_name(f"{channel_id}_{channel_title}")
+    output_path = os.path.join(output_dir, folder_name)
+    os.makedirs(output_path, exist_ok=True)
+
+    success_count = 0
+    fail_count = 0
+    skipped_count = 0
+
+    for index, filename in enumerate(files, start=1):
+        video_id = filename.replace(".txt", "")
+        
+        # Check if summary already exists (Resume capability)
+        summary_file = os.path.join(output_path, f"{video_id}.json")
+        if os.path.exists(summary_file):
+            skipped_count += 1
+            continue
+
+        print(f"[{index}/{len(files)}] Summarizing {video_id}...", end="\r")
+        
+        try:
+            with open(os.path.join(transcripts_folder, filename), "r", encoding="utf-8") as f:
+                text = f.read()
+            
+            if not text.strip():
+                print(f"\nSkipping {video_id}: Transcript file is empty.")
+                fail_count += 1
+                continue
+
+            summary = summarize_transcript(text)
+            
+            # Enrich with metadata
+            summary["video_id"] = video_id
+            summary["video_url"] = f"https://www.youtube.com/watch?v={video_id}"
+            try:
+                summary["video_title"] = extract_video_title(video_id)
+                summary["channel_id"] = channel_id
+                summary["channel_title"] = channel_title
+            except Exception:
+                pass
+
+            with open(summary_file, "w", encoding="utf-8") as f_out:
+                json.dump(summary, f_out, indent=4)
+            
+            success_count += 1
+        except Exception as e:
+            fail_count += 1
+            print(f"\n[!] Error summarizing {video_id}: {e}")
+            # Gemini might rate limit us
+            if "429" in str(e) or "quota" in str(e).lower():
+                print("Gemini quota reached. Sleeping for 60 seconds...")
+                time.sleep(60)
+            continue
+
+        if index % 10 == 0:
+            print(f"\n--- Progress Update: {index}/{len(files)} | Success: {success_count} | Failed: {fail_count} | Skipped: {skipped_count} ---")
+
+    print(f"\n\nLocal Summarization Complete!")
+    print(f"Total: {len(files)}")
+    print(f"Successful: {success_count}")
+    print(f"Failed: {fail_count}")
+    print(f"Summaries saved to {output_path}")
 
 
 def summarize_channel_videos(channel_id: str, output_dir: str = "output") -> str:
